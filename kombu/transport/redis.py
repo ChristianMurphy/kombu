@@ -207,6 +207,45 @@ end
 return #overdue
 """
 
+#: Pops one message from the first non-empty list of KEYS[3..] and, when
+#: ARGV[i + 1] is '1' for that list, records it in the unacked hash KEYS[1]
+#: and index KEYS[2] (score ARGV[1]) in the same step, so no message is ever
+#: out of the queue without being in ``unacked`` (#305).  RPOP comes first:
+#: it is not refused on a full ``noeviction`` server, and later writes of a
+#: script that already wrote are not refused either.  A message that is not
+#: kombu JSON is returned unrecorded, as BRPOP would.  Returns
+#: ``{index of the key (1-based), message, recorded (0 or 1)}`` or nil.
+#: KEYS[#KEYS] is the wake list: when ARGV[#ARGV] is '1' and messages are
+#: left, one token is pushed to it so another idle consumer wakes up.
+POP_UNACKED = """
+local nq = #KEYS - 1
+for i = 3, nq do
+    local item = redis.call('RPOP', KEYS[i])
+    if item then
+        if ARGV[#ARGV] == '1' and redis.call('EXISTS', unpack(KEYS, 3, nq)) > 0
+                and redis.call('LLEN', KEYS[#KEYS]) == 0 then
+            redis.call('LPUSH', KEYS[#KEYS], '1')
+        end
+        if ARGV[i - 1] == '1' then
+            local ok, m = pcall(cjson.decode, item)
+            if ok and type(m) == 'table' and type(m['properties']) == 'table' then
+                local p = m['properties']
+                local tag, di = p['delivery_tag'], p['delivery_info']
+                if type(tag) == 'string' and type(di) == 'table' then
+                    redis.call('ZADD', KEYS[2], ARGV[1], tag)
+                    redis.call('HSET', KEYS[1], tag, '[' .. item .. ',' ..
+                        cjson.encode(di['exchange']) .. ',' ..
+                        cjson.encode(di['routing_key']) .. ']')
+                    return {i - 2, item, 1}
+                end
+            end
+        end
+        return {i - 2, item, 0}
+    end
+end
+return nil
+"""
+
 PRIORITY_STEPS = [0, 3, 6, 9]
 
 error_classes_t = namedtuple('error_classes_t', (
@@ -313,6 +352,7 @@ class GlobalKeyPrefixMixin:
         "HSET",
         "LLEN",
         "LPUSH",
+        "LTRIM",
         "PUBLISH",
         "RPUSH",
         "RPOP",
@@ -470,8 +510,13 @@ class QoS(virtual.QoS):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._vrestore_count = 0
+        #: Tags the pop script already wrote to ``unacked``.
+        self._recorded = set()
 
     def append(self, message, delivery_tag):
+        if delivery_tag in self._recorded:
+            self._recorded.discard(delivery_tag)
+            return super().append(message, delivery_tag)
         delivery = message.delivery_info
         EX, RK = delivery['exchange'], delivery['routing_key']
         # TODO: Remove this once we solely on Redis-py 3.0.0+
@@ -1046,6 +1091,12 @@ class Channel(virtual.Channel):
     keyprefix_fanout = '/{db}.'
     sep = '\x06\x16'
     _in_poll = False
+    _in_poll_cmd = 'BRPOP'
+    _in_poll_queues = ()
+    _pop_next = True
+    _pop_sha = None
+    _restored_at = 0.0
+    _get_records = False
     _brpop_sent_at = None
     _in_listen = False
     _fanout_queues = {}
@@ -1075,6 +1126,10 @@ class Channel(virtual.Channel):
     max_connections = 10
     health_check_interval = DEFAULT_HEALTH_CHECK_INTERVAL
     client_name = None
+    #: Prototype switch for kombu issue 305: 'brpop' (main), 'hybrid',
+    #: 'poll' or 'wake'.
+    consume_mode = 'brpop'
+    poll_interval = 0.05
 
     @property
     def supports_batch_publish(self):
@@ -1157,7 +1212,9 @@ class Channel(virtual.Channel):
          'health_check_interval',
          'retry_on_timeout',
          'priority_steps',
-         'client_name')  # <-- do not add comma here!
+         'client_name',
+         'consume_mode',
+         'poll_interval')  # <-- do not add comma here!
     )
 
     connection_class = redis.Connection if redis else None
@@ -1175,6 +1232,7 @@ class Channel(virtual.Channel):
         self._sentinel_manager = None
         self._async_sentinel_manager = None
         self._expires = {}
+        self._no_ack_queues = set()
         self._binding_expiry_refreshed_at = float('-inf')
         self._bindings_swept_at = float('-inf')
         self._queue_cycle = cycle_by_name(self.queue_order_strategy)()
@@ -1274,6 +1332,8 @@ class Channel(virtual.Channel):
                 (pipe.lpush if leftmost else pipe.rpush)(
                     self._q_for_pri(queue, pri), dumps(payload),
                 )
+                if self.consume_mode == 'wake':
+                    self._signal_wake(pipe, queue)
         except self.connection_errors:
             # Abort the transaction: it would otherwise remove the message
             # from the unacked hash without requeueing it.
@@ -1300,12 +1360,16 @@ class Channel(virtual.Channel):
     def _restore_at_beginning(self, message):
         return self._restore(message, leftmost=True)
 
-    def basic_consume(self, queue, *args, **kwargs):
+    def basic_consume(self, queue, no_ack, *args, **kwargs):
+        if no_ack:
+            self._no_ack_queues.add(queue)
+        else:
+            self._no_ack_queues.discard(queue)
         if queue in self._fanout_queues:
             exchange, _ = self._fanout_queues[queue]
             self.active_fanout_queues.add(queue)
             self._fanout_to_queue[exchange] = queue
-        ret = super().basic_consume(queue, *args, **kwargs)
+        ret = super().basic_consume(queue, no_ack, *args, **kwargs)
 
         # Update fair cycle between queues.
         #
@@ -1454,36 +1518,112 @@ class Channel(virtual.Channel):
         self.connection._deliver(message, self._fanout_to_queue[exchange])
         return True
 
+    def _wake_key(self, queue):
+        return f'{queue}{self.sep}wake'
+
+    def _records_unacked(self, queue):
+        return self.ack_emulation and queue not in self._no_ack_queues
+
+    def _pop_script_args(self, queues, now):
+        """KEYS and ARGV for :data:`POP_UNACKED`, all keys unprefixed."""
+        keys = [self._q_for_pri(queue, pri) for pri in self.priority_steps
+                for queue in queues]
+        flags = ['1' if self._records_unacked(queue) else '0'
+                 for pri in self.priority_steps for queue in queues]
+        wake = self._wake_key(queues[0]) if queues else 'wake'
+        return ([self.unacked_key, self.unacked_index_key, *keys, wake],
+                [repr(now), *flags,
+                 '1' if self.consume_mode == 'wake' else '0'])
+
+    def _ensure_pop_script(self):
+        if self._pop_sha is None:
+            self._pop_sha = self.client.script_load(POP_UNACKED)
+        return self._pop_sha
+
     def _brpop_start(self, timeout=None):
         if timeout is None:
             timeout = self.brpop_timeout
         queues = self._queue_cycle.consume(len(self.active_queues))
         if not queues:
             return
-        keys = [self._q_for_pri(queue, pri) for pri in self.priority_steps
-                for queue in queues] + [timeout or 0]
+        mode = self.consume_mode
+        if mode == 'brpop' or (mode == 'hybrid' and not self._pop_next):
+            keys = [self._q_for_pri(queue, pri)
+                    for pri in self.priority_steps
+                    for queue in queues] + [timeout or 0]
+            command_args = ['BRPOP', *keys]
+            if self.global_keyprefix:
+                command_args = self.client._prefix_args(command_args)
+            self._in_poll_cmd = 'BRPOP'
+        elif self._pop_next:
+            sha = self._ensure_pop_script()
+            keys, args = self._pop_script_args(queues, time())
+            prefix = self.global_keyprefix
+            command_args = ['EVALSHA', sha, len(keys),
+                            *(prefix + k for k in keys), *args]
+            self._in_poll_cmd = 'EVALSHA'
+            self._in_poll_queues = queues
+        else:
+            # Nothing queued: wait for a wake-up token, or the poll interval.
+            wait = (self.poll_interval if mode == 'poll'
+                    else timeout or 0)
+            command_args = [
+                'BLPOP',
+                *(self.global_keyprefix + self._wake_key(q) for q in queues),
+                wait]
+            self._in_poll_cmd = 'BLPOP'
         self._in_poll = self.client.connection
         self._brpop_sent_at = monotonic()
-
-        command_args = ['BRPOP', *keys]
-        if self.global_keyprefix:
-            command_args = self.client._prefix_args(command_args)
-
         self.client.connection.send_command(*command_args)
 
+    def _deliver_popped(self, dest, item, recorded):
+        payload = loads(bytes_to_str(item))
+        tag = None
+        if recorded:
+            tag = payload['properties']['delivery_tag']
+            self.qos._recorded.add(tag)
+        try:
+            self.connection._deliver(payload, dest)
+        finally:
+            if tag is not None:
+                self.qos._recorded.discard(tag)
+
     def _brpop_read(self, **options):
+        cmd = self._in_poll_cmd
         try:
             try:
-                dest__item = self.client.parse_response(self.client.connection,
-                                                        'BRPOP',
-                                                        **options)
+                reply = self.client.parse_response(self.client.connection,
+                                                   cmd, **options)
             except self.connection_errors:
                 # if there's a ConnectionError, disconnect so the next
                 # iteration will reconnect automatically.
                 self.client.connection.disconnect()
                 raise
-            if dest__item:
-                dest, item = dest__item
+            except exceptions.NoScriptError:
+                # Server restarted or failed over: load the script again.
+                self._pop_sha = None
+                raise Empty()
+            if cmd == 'EVALSHA':
+                if not reply:
+                    self._pop_next = False
+                    raise Empty()
+                index, item, recorded = reply
+                queues = self._in_poll_queues
+                dest = queues[(int(index) - 1) % len(queues)]
+                self._queue_cycle.rotate(dest)
+                self._deliver_popped(dest, item, int(recorded))
+                return True
+            self._pop_next = True
+            if cmd == 'BLPOP':
+                if not reply and monotonic() - self._restored_at >= (
+                        self.brpop_timeout or 1):
+                    # drain_events() only restores after an empty poll,
+                    # which a short BLPOP never gives it.
+                    self._restored_at = monotonic()
+                    self.connection.cycle.maybe_restore_messages()
+                raise Empty()
+            if reply:
+                dest, item = reply
                 dest = bytes_to_str(dest).rsplit(self.sep, 1)[0]
                 self._queue_cycle.rotate(dest)
                 self.connection._deliver(loads(bytes_to_str(item)), dest)
@@ -1640,16 +1780,35 @@ class Channel(virtual.Channel):
         self._in_listen = None
         connection.disconnect()
 
-    def _get(self, queue):
-        with self.conn_or_acquire() as client:
-            for pri in self.priority_steps:
-                item = client.rpop(self._q_for_pri(queue, pri))
-                if item:
-                    self._maybe_update_queues_expire(client, queue)
-                    return loads(bytes_to_str(item))
+    def basic_get(self, queue, no_ack=False, **kwargs):
+        self._get_records = self.ack_emulation and not no_ack
+        try:
+            return super().basic_get(queue, no_ack, **kwargs)
+        finally:
+            self._get_records = False
 
+    def _get(self, queue):
+        keys, args = self._pop_script_args([queue], time())
+        if not self._get_records:
+            args[1:-1] = ['0'] * (len(args) - 2)
+        prefix = self.global_keyprefix
+        with self.conn_or_acquire() as client:
+            # The prefixed client prefixes the first key of EVALSHA only.
+            reply = self._pop_unacked(
+                keys=[keys[0], *(prefix + k for k in keys[1:])],
+                args=args, client=client)
             self._maybe_update_queues_expire(client, queue)
-            raise Empty()
+            if not reply:
+                raise Empty()
+            _, item, recorded = reply
+            payload = loads(bytes_to_str(item))
+            if int(recorded):
+                self.qos._recorded.add(payload['properties']['delivery_tag'])
+            return payload
+
+    @cached_property
+    def _pop_unacked(self):
+        return self._create_client().register_script(POP_UNACKED)
 
     def _size(self, queue):
         with self.conn_or_acquire() as client:
@@ -1682,6 +1841,9 @@ class Channel(virtual.Channel):
 
         if publish_batch is not None:
             publish_batch.add('lpush', key, dumps(message))
+            if self.consume_mode == 'wake':
+                publish_batch.add('lpush', self._wake_key(queue), '1')
+                publish_batch.add('ltrim', self._wake_key(queue), 0, 0)
             if self._expires and queue in self._expires:
                 for p in self.priority_steps:
                     publish_batch.add(
@@ -1689,6 +1851,18 @@ class Channel(virtual.Channel):
                         self._q_for_pri(queue, p),
                         self._expires[queue],
                     )
+            return
+
+        if self.consume_mode == 'wake':
+            with self.conn_or_acquire() as client:
+                with client.pipeline() as pipe:
+                    pipe.lpush(key, dumps(message))
+                    self._signal_wake(pipe, queue)
+                    if self._expires and queue in self._expires:
+                        for p in self.priority_steps:
+                            pipe.pexpire(self._q_for_pri(queue, p),
+                                         self._expires[queue])
+                    pipe.execute()
             return
 
         with self.conn_or_acquire() as client:
@@ -1700,6 +1874,12 @@ class Channel(virtual.Channel):
                     pipe.execute()
             else:
                 client.lpush(key, dumps(message))
+
+    def _signal_wake(self, pipe, queue):
+        # One pending token is enough: a consumer that pops a message and
+        # sees more left passes the token on (see POP_UNACKED).
+        pipe.lpush(self._wake_key(queue), '1')
+        pipe.ltrim(self._wake_key(queue), 0, 0)
 
     def _put_fanout(self, exchange, message, routing_key, **kwargs):
         """Deliver fanout message."""
@@ -1857,6 +2037,7 @@ class Channel(virtual.Channel):
             with client.pipeline() as pipe:
                 for pri in self.priority_steps:
                     pipe = pipe.delete(self._q_for_pri(queue, pri))
+                pipe.delete(self._wake_key(queue))
                 pipe.execute()
 
     def _has_queue(self, queue, **kwargs):

@@ -5,7 +5,7 @@ import select
 import socket
 import threading
 from time import monotonic, sleep
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import pytest
@@ -1012,6 +1012,70 @@ class test_RedisRestoreVisible:
                 assert restored is not None
                 assert restored.payload == payload
                 assert restored.headers['redelivered'] is True
+
+
+@pytest.mark.env('redis')
+@pytest.mark.parametrize('mode', ['poll', 'wake'])
+class test_RedisUnackedAtPop:
+    """A message Redis hands a consumer is in ``unacked`` at that moment.
+
+    A worker killed between taking a message from the queue and writing it
+    to ``unacked`` loses it for good (#305). ``_deliver`` raising stands in
+    for the kill, right after the reply was read.
+    """
+
+    def _consume_and_die(self, connection, mode, redis_client, queues,
+                         wait_first=False):
+        unacked = f'unacked_at_pop_{uuid4().hex}'
+        connection = connection.clone(transport_options={
+            **connection.transport_options, 'unacked_key': unacked,
+            'unacked_index_key': f'{unacked}_index', 'consume_mode': mode})
+        keyprefix = connection.transport_options.get('global_keyprefix', '')
+        with connection as conn:
+            channel = conn.default_channel
+            for q in queues:
+                q(channel).declare()
+            consumer = kombu.Consumer(channel, queues, callbacks=[Mock()])
+            consumer.consume()
+            with conn.clone() as publisher:
+                producer = kombu.Producer(publisher)
+                if wait_first:
+                    # Consumer idle first, so the message reaches it while
+                    # it waits for one.
+                    with pytest.raises(socket.timeout):
+                        conn.drain_events(timeout=0.3)
+                producer.publish({'n': 1}, exchange=queues[-1].exchange,
+                                 routing_key=queues[-1].routing_key,
+                                 priority=9)
+            with patch.object(conn.transport, '_deliver',
+                              side_effect=KeyboardInterrupt):
+                with pytest.raises(KeyboardInterrupt):
+                    conn.drain_events(timeout=5)
+            stored = redis_client.hgetall(f'{keyprefix}{unacked}')
+            index = redis_client.zrange(f'{keyprefix}{unacked}_index', 0, -1)
+            channel.qos._delivered.clear()
+            for q in queues:
+                q(channel).delete()
+            redis_client.delete(f'{keyprefix}{unacked}',
+                                f'{keyprefix}{unacked}_index')
+        return stored, index
+
+    @pytest.mark.parametrize('wait_first', [False, True])
+    def test_killed_consumer_leaves_message_unacked(
+            self, connection, redis_client, mode, wait_first):
+        name = f'unacked_at_pop_{uuid4().hex}'
+        exchange = kombu.Exchange(name, 'direct')
+        queues = [kombu.Queue(f'{name}_{i}', exchange,
+                              routing_key=f'{name}_{i}', max_priority=9)
+                  for i in range(3)]
+        stored, index = self._consume_and_die(
+            connection, mode, redis_client, queues, wait_first)
+        assert len(stored) == 1
+        (tag, raw), = stored.items()
+        assert index == [tag]
+        payload, exchange_name, routing_key = loads(raw)
+        assert (exchange_name, routing_key) == (name, f'{name}_2')
+        assert payload['properties']['delivery_tag'] == tag
 
 
 @pytest.mark.env('redis')

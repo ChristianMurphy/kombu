@@ -135,7 +135,28 @@ class Client:
             self.sets[key].add(member1)
 
     def register_script(self, script):
+        if script == redis.POP_UNACKED:
+            return self.pop_unacked
         return lambda keys=(), args=(), client=None: 0
+
+    def pop_unacked(self, keys=(), args=(), client=None):
+        # Python stand-in for the POP_UNACKED Lua script.
+        unacked, index, *queues, _ = keys
+        for i, key in enumerate(queues, 1):
+            item = self.rpop(key)
+            if item:
+                if args[i] == '1':
+                    payload = loads(item)
+                    props = payload['properties']
+                    tag, info = props['delivery_tag'], props['delivery_info']
+                    self.zadd(index, {tag: float(args[0])})
+                    self.hset(unacked, tag, dumps(
+                        [payload, info['exchange'], info['routing_key']]))
+                    return [i, item, 1]
+                return [i, item, 0]
+
+    def script_load(self, script):
+        return 'sha'
 
     def smembers(self, key):
         return self.sets.get(key, set())
@@ -154,7 +175,10 @@ class Client:
             return 0
 
     def lpush(self, key, value):
-        self.queues[key].put_nowait(value)
+        self.queues.setdefault(key, _Queue()).put_nowait(value)
+
+    def ltrim(self, key, start, end):
+        pass
 
     def parse_response(self, connection, type, **options):
         cmd, queues = self.connection._sock.data.pop()
@@ -167,6 +191,9 @@ class Client:
             if item:
                 return item
             raise Empty()
+        if type == 'EVALSHA':
+            _, numkeys, *rest = queues
+            return self.pop_unacked(rest[:numkeys], rest[numkeys:])
 
     def brpop(self, keys, timeout=None):
         for key in keys:
@@ -1587,6 +1614,80 @@ class test_Channel:
             self.channel._brpop_read()
 
         c.connection.disconnect.assert_called_with()
+
+    @pytest.mark.parametrize('mode', ['poll', 'wake', 'hybrid'])
+    def test_popped_message_is_unacked_before_it_is_delivered(self, mode):
+        # A worker killed right after Redis hands it a message must leave
+        # that message in ``unacked``, where the visibility timeout restores
+        # it (#305).  ``_deliver`` raising stands in for the kill.
+        channel = self.channel
+        channel.consume_mode = mode
+        name = f'unacked_at_pop_{mode}'
+        channel.exchange_declare(name)
+        channel.queue_declare(name)
+        channel.queue_bind(name, name, name)
+        channel.basic_consume(name, False, Mock(), name)
+        channel.client.hashes[channel.unacked_key].clear()
+        channel.basic_publish(
+            channel.prepare_message('task'), name, name)
+        channel.connection._deliver = Mock(side_effect=SystemExit)
+
+        with pytest.raises(SystemExit):
+            channel._brpop_start()
+            channel._brpop_read()
+
+        unacked = channel.client.hashes[channel.unacked_key]
+        assert len(unacked) == 1
+        payload, exchange, routing_key = loads(next(iter(unacked.values())))
+        assert (exchange, routing_key) == (name, name)
+        assert channel.qos._recorded == set()
+
+    def test_popped_message_is_not_written_twice(self):
+        channel = self.channel
+        channel.consume_mode = 'poll'
+        channel.exchange_declare('once')
+        channel.queue_declare('once')
+        channel.queue_bind('once', 'once', 'once')
+        callback = Mock()
+        channel.basic_consume('once', False, callback, 'once')
+        channel.basic_publish(channel.prepare_message('task'), 'once', 'once')
+        channel.qos.pipe_or_acquire = Mock()
+
+        channel._brpop_start()
+        assert channel._brpop_read()
+
+        callback.assert_called_once()
+        channel.qos.pipe_or_acquire.assert_not_called()
+        assert callback.call_args[0][0].delivery_tag in channel.qos._delivered
+        channel.qos._delivered.clear()
+
+    def test_no_ack_consumer_leaves_nothing_unacked(self):
+        channel = self.channel
+        channel.consume_mode = 'poll'
+        channel.exchange_declare('noack')
+        channel.queue_declare('noack')
+        channel.queue_bind('noack', 'noack', 'noack')
+        channel.basic_consume('noack', True, Mock(), 'noack')
+        channel.client.hashes[channel.unacked_key].clear()
+        channel.basic_publish(channel.prepare_message('x'), 'noack', 'noack')
+
+        channel._brpop_start()
+        assert channel._brpop_read()
+
+        assert not channel.client.hashes[channel.unacked_key]
+
+    def test_empty_pop_waits_before_popping_again(self):
+        channel = self.channel
+        channel.consume_mode = 'wake'
+        keys = self._brpop_queue(channel)
+        channel.client.connection.send_command.side_effect = None
+        channel._pop_next = False
+
+        channel._brpop_start(timeout=5)
+
+        channel.client.connection.send_command.assert_called_once_with(
+            'BLPOP', channel._wake_key('q'), 5)
+        assert keys
 
     def test_brpop_read_gives_None(self):
         c = self.channel.client = Mock()
