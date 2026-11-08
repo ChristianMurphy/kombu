@@ -1862,6 +1862,8 @@ class Channel(virtual.Channel):
                         for p in self.priority_steps:
                             pipe.pexpire(self._q_for_pri(queue, p),
                                          self._expires[queue])
+                        pipe.pexpire(self._wake_key(queue),
+                                     self._expires[queue])
                     pipe.execute()
             return
 
