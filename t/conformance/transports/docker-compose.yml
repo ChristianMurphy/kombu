@@ -1,0 +1,62 @@
+# Services for the transport conformance suite. Start what you need:
+#   docker compose -f t/conformance/transports/docker-compose.yml up -d redis toxiproxy
+# then run, for example:
+#   pytest t/conformance/transports --transport redis
+#
+# The transport-* services are the ones test_faults.py restarts
+# (CONFORMANCE_RESTART=1); they listen on their own ports so a restart
+# doesn't disturb anything else.
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    network_mode: host
+  redis:
+    image: mirror.gcr.io/library/redis:7
+    ports: ["6379:6379"]
+  valkey:
+    image: mirror.gcr.io/valkey/valkey:8
+    ports: ["6380:6379"]
+  rabbitmq:
+    image: mirror.gcr.io/library/rabbitmq:3.13-management
+    ports: ["5672:5672", "15672:15672"]
+  pgmq:
+    image: ghcr.io/pgmq/pg17-pgmq:latest
+    environment: {POSTGRES_PASSWORD: postgres}
+    ports: ["5433:5432"]
+  postgres:
+    image: mirror.gcr.io/library/postgres:16
+    environment: {POSTGRES_PASSWORD: pw, POSTGRES_DB: celery}
+    ports: ["5432:5432"]
+  mongodb:
+    image: mirror.gcr.io/library/mongo:7
+    ports: ["27017:27017"]
+  consul:
+    image: mirror.gcr.io/hashicorp/consul:1.19
+    command: agent -dev -client=0.0.0.0
+    ports: ["8500:8500"]
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.15
+    command: >-
+      etcd --enable-v2=true --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://127.0.0.1:2379
+    environment: {ETCDCTL_API: "2"}
+    ports: ["2379:2379"]
+  zookeeper:
+    image: mirror.gcr.io/library/zookeeper:3.9
+    ports: ["2181:2181"]
+  kafka:
+    image: mirror.gcr.io/apache/kafka:3.8.0
+    ports: ["9092:9092"]
+  transport-redis:
+    image: mirror.gcr.io/library/redis:7
+    container_name: transport-redis
+    ports: ["26379:6379"]
+  transport-rabbitmq:
+    image: mirror.gcr.io/library/rabbitmq:3.13-management
+    container_name: transport-rabbitmq
+    ports: ["25672:5672"]
+  transport-pgmq:
+    image: ghcr.io/pgmq/pg17-pgmq:latest
+    container_name: transport-pgmq
+    environment: {POSTGRES_PASSWORD: postgres}
+    ports: ["15433:5432"]
